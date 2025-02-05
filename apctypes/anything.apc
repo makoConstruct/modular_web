@@ -1,0 +1,3 @@
+(class Dogey
+    (var String name)
+    (var Int legCount))

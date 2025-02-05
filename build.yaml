@@ -1,0 +1,22 @@
+
+
+builders:
+  from_files:
+    import: "package:modular_web/builder.dart"
+    builder_factories: ["fromFilesBuilder"]
+    build_extensions: {".apc": [".apc.g.dart"]}
+    auto_apply: root_package
+    defaults:
+      generate_for:
+        include:
+          # for some reason I couldn't get it to scan just apctypes. Oh well, apc files are source code too.
+          - lib/apctypes/**
+    build_to: source
+
+# targets:
+#   $default:
+#     builders:
+#       apc|from_files:
+#         generate_for:
+#           - apc_types/*.apc
+          

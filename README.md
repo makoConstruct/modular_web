@@ -1,0 +1,1 @@
+Basics for working with the mw distributed typed object system. Identity, permissioning, syncing, rpc, pubsub.
