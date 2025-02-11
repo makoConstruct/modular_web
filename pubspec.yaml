@@ -2,12 +2,11 @@ name: modular_web
 description: Everything you need to build modular apps in dart/flutter.
 version: 0.1.0
 publish_to: none
-# repository: https://github.com/my_org/my_repo
+repository: https://github.com/makoConstruct/modular_web
 
 environment:
   sdk: ^3.6.0
 
-# Add regular dependencies here.
 dependencies:
   # path: ^1.8.0
   cbor: ^6.3.3
@@ -15,8 +14,12 @@ dependencies:
   dataclass: ^1.0.0
   build_runner: ^2.0.0
   build: ^2.0.0
+  woodslist: ^0.1.0
+
+dependency_overrides:
   woodslist:
-    path: ../termpose/dart
+    path: ../termpose/dart/
+    version: 0.2.0
 
 dev_dependencies:
   lints: ^5.0.0

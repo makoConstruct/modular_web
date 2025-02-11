@@ -1,17 +1,13 @@
 import 'dart:collection';
 
-import 'package:woodslist/woodslist.dart';
 import 'package:modular_web/modular_web.dart';
+import 'package:woodslist/woodslist.dart';
 
 // wapc is a woodslist format that represents APC types. Apc types for checking and stuff are encoded using the wire format (ApcTypeDef extends Object), but we can write them with text using wapc.
 
 String dartFileForTTypes(List<TType> apc) {
   return throw UnimplementedError();
 }
-
-/*
-
-*/
 
 class ParseError extends Error {
   final String message;
@@ -32,6 +28,13 @@ Wood assertGet(Wood b, int i, {String? message}) {
         message ?? 'branch should have at least ${i + 1} elements', [b]);
   }
   return b.v[i];
+}
+
+String assertString(Wood w) {
+  if (w is! Leaf) {
+    throw ParseError("this should be a string", [w]);
+  }
+  return w.initialStr();
 }
 
 Wood? maybeGet(Branch b, int i) {
@@ -90,18 +93,17 @@ class Scope {
     return ret;
   }
 
-  List<HandleCell> registerTypeParameters(Wood w) {
-    HandleCell hc;
+  void registerTypeParameter(Wood w) {
     // this is wrong, you parsed them as if they were the inputs, they're the parameter declarations
     if (w is Branch) {
-      Wood term =
-          assertGet(w, 0, message: "an empty branch here is meaningless");
-      for (int ii = 1; ii < w.v.length; ++ii) {
-        registerTypeParameters(ww);
+      if (w.v.length != 2) {
+        throw ParseError("should be a pair of (<Type> <name>)", [w]);
       }
+      Wood tw = w.v[0];
+      String name = w.v[1].initialStr();
+      HandleCell type = parseType(tw);
     } else {
-      String token = w.initialStr();
-      registerMention(token, w);
+      registerDefinition(token, w);
     }
   }
 }
