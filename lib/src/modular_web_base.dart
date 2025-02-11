@@ -279,7 +279,7 @@ abstract class Obj {
   SplayTreeMap<Ref<TType>, Obj> totalExtending;
 
   /// we expose this when you already have the ID on construction (IE, when you were sent an object) so that it doesn't have to be computed again
-  /// should usually be called via a batch ID assignment to account for knots.
+  /// should usually only be called via a batch ID assignment to account for knots, though batch assignments may need to assign more than once, first a local ref, second the burl ref.
   assignID(Ref v) {
     _ref = v;
   }
