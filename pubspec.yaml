@@ -15,12 +15,12 @@ dependencies:
   build_runner: ^2.0.0
   build: ^2.0.0
   woodslist: ^0.1.0
-  set_list: ^0.2.0
+  set_list: ^0.3.0
 
 dependency_overrides:
   set_list:
     path: ../SetList/
-    version: ^0.2.0
+    version: ^0.3.0
   woodslist:
     path: ../termpose/dart/
     version: 0.3.0
