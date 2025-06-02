@@ -3,11 +3,12 @@ Basics for working with the mw distributed typed object system. Identity, permis
 
 ## about modular types
 
-- A composable, cross-language type system, format, and meta-protocol. A language of languages for social computing. A way of saying all that can easily be said to computers about what your networked objects are.
+- A composable, cross-language type system and encoding for data and API signatures. A language of languages for social computing.
 - A __downcast__ operation that allows modular objects to be extended by anyone with additional fields without ever breaking other peoples' code.
 - An __upcast__ operation/__Any__ type that allows, eg, arbitrary objects to be attached to posts in user-extensible web apps with enough type information for the computer to automatically fetch a viewer/editor that the community recommends for that object in that context.
 - Modular types was made for [modular web], but it's intended for general use in all languages and frameworks whenever they need to communicate over the network.
-- modular types are referenced with content-addresses, which means anyone can create a type, and if others use it, the type definition will stay available forever, while also guaranteeing that components of a type will never have id or member name collisions. To achieve this, we've expanded on the standard IPLD format by introducing a way of representing self-referential structures, which types often require. This is also sometimes needed for serialisation of object graphs [show examples] in high level applications.
+- modular types are referenced with content-addresses, which essentially means anyone can create a type, and if others use it, the type definition will stay available forever, while also guaranteeing that components of a type will never have id or member name collisions.
+- To achieve this, we've expanded on the standard IPLD format by introducing a way of representing self-referential structures, which types often require. Cyclic structure is also sometimes needed for [serialisation of object graphs](https://whtwnd.com/did:plc:2mfp3fiamge4hp6s5xmki7vm/entries/Self-referential%2Fcyclic%20structure%20is%20both%20necessary%20and%20possible%20in%20content-addressed%20protocols%2C%20but...) in high level applications.
 - type system features:
     - Inheritance
     - Parametric types
