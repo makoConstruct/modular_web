@@ -10,13 +10,15 @@ People who should read this:
 
 People who should not read this:
 
-- People who are trying to learn how the protocol generally works and appraise its quality.
+- People who are trying to learn how the protocol generally works, or appraise its quality.
 
 Reading the spec is a terrible way of getting to know the protocol.
 
 Learning about a protocol by reading the spec is like learning a language by reading a dictionary.
 
-The spec is a long list of low-level details that are mostly abstracted away in the user experience. The spec looks and feels nothing like using the thing. The best way to understand the protocol is to read the overview. I have not written the overview yet though sorry.
+The spec is a long list of low-level details that are mostly abstracted away in the user experience. The spec looks and feels nothing like using the thing. The best way to develop a high level understanding of the protocol is to read the overview.
+
+I have not written the overview yet though sorry.
 
 ## enums
 
@@ -41,7 +43,7 @@ enum Code {
   }
 }
 
-->
+≈
 
 abstract sealed class Code {
   var author: Author
@@ -65,7 +67,7 @@ class Evaluation extends Code {
   Evaluation(this.function, this.args, author: Author): super(author, 2) {}
 }
 
-->
+≈
 
 class FunctionT implements Code {
     Author get author => component[types.codeType];

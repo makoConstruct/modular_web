@@ -6,6 +6,10 @@
 // we implement entities as structures over components. Components can be accessed against a single type. Using Dart's inheritance system to represent multiple inheritance heirarchies isn't always possible due to dart's name collision issues: Codegen'd entitty types generally cannot extend all of their component types. The extension relation can be represented in the data but not always in the dart binding.
 // this file consists mostly of bootstrapping of the basic types needed to run parsers and evaluate type paramtizations. Once we have that, all further types should be defined and generated using the DSL.
 
+// checklist
+// [] make sure everything sets its late variables
+// [] make sure variant discriminators are right
+
 import 'dart:async';
 import 'dart:collection';
 import 'dart:math';
@@ -13,6 +17,7 @@ import 'dart:typed_data';
 import 'package:cbor/cbor.dart';
 import 'package:crypto/crypto.dart';
 import 'package:set_list/set_list.dart';
+import 'util.dart';
 
 import 'interpreter.dart';
 // import 'package:multiformats/multiformats.dart';
@@ -53,11 +58,14 @@ typedef CID = Uint8List;
 enum OPSegmentKind implements Comparable<OPSegmentKind> {
   cid,
   parent,
-  indexing;
+  // denotes an int indexing a component (or ObjRoot) for a component that it extends.
+  component_indexing,
+  // denotes an int indexing a group
+  group_indexing;
 
   @override
   int compareTo(OPSegmentKind other) => index.compareTo(other.index);
-  
+
   // also consider adding: type_component, a type that matches against the first component that has that type
   static OPSegmentKind fromInt(int v) {
     switch (v) {
@@ -66,7 +74,9 @@ enum OPSegmentKind implements Comparable<OPSegmentKind> {
       case 1:
         return OPSegmentKind.parent;
       case 2:
-        return OPSegmentKind.indexing;
+        return OPSegmentKind.component_indexing;
+      case 3:
+        return OPSegmentKind.group_indexing;
       default:
         throw StateError("unknown OP segment variant");
     }
@@ -98,7 +108,7 @@ class OPSegment implements Comparable<OPSegment> {
             [CborInt(BigInt.zero), cidToCbor(hash!, shouldTagLink)]);
       case OPSegmentKind.parent:
         return CborList([CborInt(BigInt.one)]);
-      case OPSegmentKind.indexing:
+      case OPSegmentKind.group_indexing:
         return CborList([CborInt(BigInt.two), CborInt(BigInt.from(index!))]);
     }
   }
@@ -110,13 +120,13 @@ class OPSegment implements Comparable<OPSegment> {
     }
     return false;
   }
-  
+
   @override
   int compareTo(OPSegment other) {
     if (kind != other.kind) {
       return kind.compareTo(other.kind);
     }
-    if(kind == OPSegmentKind.indexing) {
+    if(kind == OPSegmentKind.group_indexing) {
       return index!.compareTo(other.index!);
     }
     if(kind == OPSegmentKind.cid) {
@@ -147,7 +157,7 @@ class OPSegment implements Comparable<OPSegment> {
     if(kind == OPSegmentKind.parent) {
       return OPSegment(kind);
     }
-    if(kind == OPSegmentKind.indexing) {
+    if(kind == OPSegmentKind.group_indexing) {
       if(sg.length < 2) {
         throw AssertionError("Ref indexing segments should be lists with two elements");
       }
@@ -160,14 +170,16 @@ class OPSegment implements Comparable<OPSegment> {
   }
 }
 
-int compareList<T extends Comparable>(List<T> a, List<T> b) {
-  for (int i = 0; i < a.length; i++) {
-    int c = a[i].compareTo(b[i]);
+int compareList<T>(List<T> a, List<T> b, {int Function(T, T)? compare}) {
+  final ml = min(a.length, b.length);
+  compare ??= (a, b) => (a as Comparable).compareTo(b);
+  for (int i = 0; i < ml; i++) {
+    int c = compare(a[i], b[i]);
     if (c != 0) {
       return c;
     }
   }
-  return 0;
+  return a.length.compareTo(b.length);
 }
 
 /// Object Path. (Relative) paths are needed to point at any objects involved in cycles, so all refs are represented as paths just in case.
@@ -178,13 +190,13 @@ class Ref<T extends Obj> implements Comparable<Ref<T>> {
   Ref.intoBurl(CID burl, int index) {
     this.segments = [
       OPSegment(OPSegmentKind.cid, hash: burl),
-      OPSegment(OPSegmentKind.indexing, index: index)
+      OPSegment(OPSegmentKind.group_indexing, index: index)
     ];
   }
   Ref.sameBurl(int index) {
     this.segments = [
       OPSegment(OPSegmentKind.parent),
-      OPSegment(OPSegmentKind.indexing, index: index)
+      OPSegment(OPSegmentKind.group_indexing, index: index)
     ];
   }
   Ref._empty() : segments = [];
@@ -199,7 +211,7 @@ class Ref<T extends Obj> implements Comparable<Ref<T>> {
     }
     return true;
   }
-  
+
   @override
   int compareTo(Ref<T> other) {
     return compareList(segments, other.segments);
@@ -241,7 +253,7 @@ class Ref<T extends Obj> implements Comparable<Ref<T>> {
   bool operator ==(Object other) {
     return other is Ref && segments == other.segments;
   }
-  
+
   static Ref parse(CborValue v) {
     final vv = assumeParseList(v);
     return Ref.fromList(vv.map((e) => OPSegment.parse(e)).toList());
@@ -369,56 +381,53 @@ class UncommittedObjectError extends StateError {
   UncommittedObjectError(super.message);
 }
 
-typedef TypeMap = SplayTreeMap<Ref<TType>, Obj>;
+typedef TypeMap = MapList<TType, Component>;
 
 /// a distributed object that can be published, referred to by relations, cached or pinned in a local database
 /// for Dart, making Objs fully immutable isn't possible, but they should generally behave as if they are immutable.
-/// note, many fields in Obj (mainly those that are Obj or contain Objs) must be `late`, as any Obj can participate in cycles due to intersection types (If type A links to a type B, then an A&B referring to another A&B forms a cycle).
-/// Most Objs you receive are a component of a larger object. You can gain access to the whole object through `ancestor`. The ref is taken from `ancestor`.
+/// note, many fields in Obj (mainly those that are Obj or contain Objs) must be `late`, as due to intersection types, *any* Obj can participate in cycles.
+/// Most Objs you receive represent just one or a few components of a potentially larger object, to ensure that your code will continue to function even if unexpected components are added to the data. You can gain access to the whole object through `totality: RootObj`, which structures them as `Components`, which aren't Objs but maybe should be??.. (early on I was calling the DynamicObjs). I think the name of `Obj`s is misleading but is a useful childslie.
+/// An Obj's ref is just the same as its `totality`'s ref.
 abstract class Obj {
-  late final Eobj family;
-  Obj get totalRoot => family.root;
+  late final ObjRoot totality;
+  Component get totalRoot => totality.root;
 
-  Ref get ref => family.ref;
+  // todo: should the ref be the component ref?
+  Ref get ref => totality.ref;
 
-  TypeMap? _components;
-
-  /// The components of this object. EG, if this class inherited Int, directly or indirectly, then there would be an Int entry in `components`.
-  TypeMap get components {
-    if (_components == null) {
-      _components = SplayTreeMap();
-      _populateComponentTable(_components!);
-    }
-    return _components!;
-  }
+  late final Component component;
 
   /// The components of the overall object this is part of, not necessarily inherited by this component seeing.
-  TypeMap get familyCompnents => family.root.components;
+  TypeSet get familyComponents => totality.root.components;
 
   /// instance data of the objects this inherits
   late final List<Obj> extending;
 
-  // this is late just because the TypeType needs to be its own type
-  late final TType type;
-  
-  String? get rootName => (type.family[std.nameType] as Name?)?.name;
+  /// this will be null for 'unloaded' components, which are components for which we don't have a fully resolved type. We can fetch one of course. But you usually don't need to, if you need any of the subcomponents, you can get those without knowing the type. Type checking can be performed without most of the type information.
+  TType? _type;
+  void setType(TType t) {
+    if(_type != null) {
+      throw UncommittedObjectError("attempt to overwrite an already resolved type");
+    }
+    _type = t;
+  }
+
+  TType get type => _type ?? (throw UncommittedObjectError("attempt to access the type of an unloaded component"));
+
+  String? rootName() => (type.totality[std.nameType] as Name?)?.name;
+
+  /// some objs have parents, which identify them?
+  Obj? parent() => type.component.primaryLens();
 
   /// the rough amount of memory this object takes up
   int roughSize = 100;
 
   Obj({TType? type, List<Obj>? extending}) {
     if (type != null) {
-      this.type = type;
+      this._type = type;
     }
     if (extending != null) {
       this.extending = extending;
-    }
-  }
-
-  void _populateComponentTable(TypeMap table) {
-    table.putIfAbsent(type.ref as Ref<TType>, () => this);
-    for (Obj o in extending) {
-      o._populateComponentTable(table);
     }
   }
 
@@ -434,11 +443,124 @@ abstract class Obj {
   }
 
   void trace(Function(Obj) visitor) {
-    family.trace(visitor);
+    totality.trace(visitor);
   }
 
-  /// the entity representation, which consists of a list of components, each of which is a pair of a type ref and a cbor value. If you only expect your object to have one component, then inherit Ubj instead of Obj. Ubj's `toCbor` has a simpler signature.
+  /// the entity representation, which consists of a list of components, each of which is a pair of a type ref and a cbor value. If you only exect your object to have one component, then inherit Ubj instead of Obj. Ubj's `toCbor` has a simpler signature.
   CborValue toCbor();
+
+  Component toComponent(int index) {
+    return Component(type: type, value: toCbor(), extending: extending.indexed.map((p) => p.$2.toComponent(p.$1)).toList(), index: index)..lenses.add(this);
+  }
+}
+
+/// when you want to grab the parts of a Component that conform to a type, you'll be given a Conformance that presents the parts you want. You'll generally then convert that into an Obj.
+class Conformance {
+  final TType on;
+  final Component? just;
+  final List<Component>? parameters;
+  Conformance(this.on, {this.just, this.parameters});
+}
+
+/// a partially parsed component. Should be accessed via a lens, which is a native dart type that reflects the data of this component and possibly others.
+/// A type through which to explore any component, even unknown ones if you want.
+/// Why aren't these Objs? Because a component can have multiple Obj lenses, and the lenses can overlap, and only cover part of the structure.
+class Component implements Comparable<Component>{
+  final TType type;
+  // why keep this?
+  final int index;
+  late final Component? parent;
+  final List<Component> extending;
+  /// The components of this object. EG, if this class inherited Int, directly or indirectly, then there would be an Int entry in `components`.
+  TypeMap? _components;
+  TypeMap components() {
+    if (_components == null) {
+      _components = TypeMap.assumeSorted([]);
+      _populateComponentTable(_components!);
+    }
+    return _components!;
+  }
+  void _populateComponentTable(TypeMap table) {
+    table.add(type, this);
+    for (Component c in extending) {
+      c._populateComponentTable(table);
+    }
+  }
+
+  final CborValue value;
+  List<Obj> lenses = [];
+  Component({required this.type, required this.value, required this.extending, required this.index});
+
+  @override
+  int compareTo(Component other) {
+    return type.compareTo(other.type);
+  }
+
+  /// selects the components required to fulfil it, or null if those components aren't here
+  /// not fast, but objects generally don't have very many components so it's fine.
+  /// throws if this can't be casted to t
+  Conformance conform(TType t) {
+    if(type.ref == t.ref) {
+      return Conformance(t, just: this);
+    }
+    if(t is IntersectionType){
+      List<Component> found = [];
+      List<TType> errors = [];
+      bool didError()=> errors.isNotEmpty;
+      components().comparisonScan(t.allSupertypes(), onlyInOther: (k) {
+        if(errors != null) {
+          errors.add(k);
+        } else {
+          return null;
+        }
+      }, inBoth: (k, v){
+        found.add(v);
+      });
+      if(didError()) {
+        throw TypeError("type ${t.fname()} is not a supertype of ${type.fname()}");
+      }
+      assert(found.length == t.parts.length);
+      return Conformance(t, parameters: found);
+    }else if(t is ParametizedType){
+      // I guess we'll take variance into account
+      final comps = components();
+      int fi = comps.v.findFirstPlace((tp)=> (tp.pt as ParametizedType).ref.compareTo(t.pt.ref));
+      while((comps.v.v[fi].$1 as ParametizedType).pt.ref == t.pt.ref) {
+        fi++;
+      }
+      if(fi == comps.v.length) {
+        throw TypeError("type ${t.fname()} is not a supertype of ${type.fname()}");
+      }
+      return Conformance(t, parameters: comps.v.sublist(fi));
+    }else {
+
+    }
+  }
+
+  /// may just conform, and if that fails, conforms to the parent and so on
+  Conformance? cast(TType t) {
+
+  }
+
+  Obj? primaryLens() {
+    if(lenses.isNotEmpty) {
+      return lenses.first;
+    }
+    return type.createLens(this);
+  }
+}
+
+
+class Program extends Obj {
+  late final List<Code> content;
+  late final Code root;
+  Program(this.content, this.root): super(type: std.programType, extending: [Burl(content)]);
+  // doesn't own content, gets traced in Burl
+  @override
+  void traceComponent(Function(Obj) visitor) {}
+
+  @override
+  CborValue toCbor() => CborNull();
 }
 
 class Burl extends Obj {
@@ -455,12 +577,18 @@ class Burl extends Obj {
   }
 }
 
+/// represents your computer. Contains actors who can be messaged if the actor address is known. Hosts can be persisted to disk.
+// hmm... of course a host should be mutable
+class Host extends Obj {
+
+}
+
 /// Entity, or Entire Object. The root ancestor of a component object (Obj) heirarchy, from which the Ref was calculated.
 /// the type of an Eobj is indeterminate for two very good reasons.
 /// - One is that your code shouldn't care what the type of the root ancestor is, one of the great properties of the apc protocol is that anyone can add additional components to a type and you can still grab the component you want even if you know nothing about those other components. Your code should never reuqire the Obj's Eobj to be a particular type.
 /// - Another reason is that we use that mechanism to add a nonce when necessary, so we don't know whether this will be a nonced type or not until it's serialized.
-class Eobj {
-  final Obj root;
+class ObjRoot {
+  final Component root;
   Ref? _ref;
   BigInt nonce = BigInt.zero;
 
@@ -475,9 +603,9 @@ class Eobj {
       ? _ref!
       : throw UncommittedObjectError(
           "attempt to access the Ref of an object that hasn't been published yet. Remember to use uplink.commit(this) soon after object construction.");
-  Eobj({required this.root}) {
+  ObjRoot({required this.root}) {
     void assignAncestor(Obj o) {
-      o.family = this;
+      o.totality = this;
       for (Obj ext in o.extending) {
         assignAncestor(ext);
       }
@@ -485,10 +613,10 @@ class Eobj {
 
     assignAncestor(root);
   }
-  
-  Obj? operator [](TType t) => root.components[t];
 
-  Eobj get ancestor => this;
+  Component? operator [](TType t) => root.components[t];
+
+  ObjRoot get ancestor => this;
 
   // where does the nonce go?
   CborValue toCbor() {
@@ -852,29 +980,43 @@ List<CborValue> assumeParseList(CborValue value, [int? length]) {
   throw AssertionError("CborList expected here in Obj parse");
 }
 
-class TypeList extends SetList<TType> {
-  TypeList(List<TType> v) : super(v);
-  static comparator(TType a, TType b) {
+class TypeSet extends SetList<TType> {
+  TypeSet(List<TType> v) : super(v, compare: comparator);
+  static int comparator(Obj a, Obj b) {
     // todo: sort such that parametrics of the same term together, so that a search can be done on the term, and then each result can be checked for variance supertyping.
-    return a.compareTo(b);
+    if(a is ParametizedType && b is ParametizedType) {
+      int c = a.pt.ref.compareTo(b.pt.ref);
+      if(c != 0) {
+        return c;
+      }
+      return compareList<Obj>(a.parameters, b.parameters, compare: comparator);
+    }else if(a is ParametizedType) {
+      return 1;
+    }else if(b is ParametizedType) {
+      return -1;
+    }
+    return a.ref.compareTo(b.ref);
   }
 }
+
+
 
 /// a concrete type
 abstract class TType extends Obj implements Comparable<TType> {
   /// iff true, encoded without a vtable/type information
-  late final bool raw = false;
-  late final bool nonced = true;
+  final bool raw;
+  final bool nonced;
+  final bool abstract;
   late final int girth;
-  late final SetList<TType> typeExtending;
-  SetList<TType>? _allTypeComponents;
-  SetList<TType> get allTypeComponents {
-    if(_allTypeComponents == null) {
-      _allTypeComponents = SetList([]);
-      collectComponents(_allTypeComponents!);
-      _allTypeComponents!.v.sort();
+  late final TypeSet typeExtending;
+  TypeSet? _allSypertypes;
+  TypeSet allSupertypes() {
+    if(_allSypertypes == null) {
+      _allSypertypes = TypeSet([]);
+      collectComponents(_allSypertypes!);
+      _allSypertypes!.v.sort();
     }
-    return _allTypeComponents!;
+    return _allSypertypes!;
   }
   void collectComponents(SetList<TType> out) {
     for(final t in typeExtending.v) {
@@ -882,20 +1024,20 @@ abstract class TType extends Obj implements Comparable<TType> {
       t.collectComponents(out);
     }
   }
-  TType({SetList<TType>? typeExtending, super.extending}) : super(type: std.typeType) {
+  TType({TypeSet? typeExtending, super.extending, this.raw = false, this.nonced = true, this.abstract = false}) : super(type: Std.staticTypeType) {
     if (typeExtending != null) {
       this.typeExtending = typeExtending;
     } else {
-      this.typeExtending = SetList([]);
+      this.typeExtending = TypeSet([]);
     }
     girth = this.typeExtending.v.length != 0 ? this.typeExtending.v.map((e) => e.girth).reduce((a, b) => a + b) : 1;
   }
   /// needed for bootstrapping typeType
-  TType.noType({SetList<TType>? typeExtending}) {
+  TType.noType({TypeSet? typeExtending, this.raw = false, this.nonced = true, this.abstract = false}) {
     if (typeExtending != null) {
       this.typeExtending = typeExtending;
     } else {
-      this.typeExtending = SetList([]);
+      this.typeExtending = TypeSet([]);
     }
   }
   @override operator==(Object other) {
@@ -905,26 +1047,102 @@ abstract class TType extends Obj implements Comparable<TType> {
     return false;
   }
   @override
-  int compareTo(TType other) => ref.compareTo(other.ref);
+  int compareTo(TType other){
+    // this conditional could be paraphrased as a general case where non-parametized types are just parametized types with zero parameters
+    // the reason we do this all here instead of overriding compareTo in ParametizedType is that that would be assymetric, it wouldn't work right on TType < ParametizedType, TType in fact has to know about and regard ParametizedType
+    if(this is ParametizedType && other is ParametizedType) {
+      final thispt = this as ParametizedType;
+      if(thispt.pt != other.pt) {
+        return thispt.pt.ref.compareTo(other.pt.ref);
+      }
+      if(thispt.parameters.length != other.parameters.length) {
+        return thispt.parameters.length.compareTo(other.parameters.length);
+      }
+      return compareList(thispt.parameters, other.parameters);
+    }else if (this is ParametizedType && other is! ParametizedType) {
+      // parametized types are after non-parametized types
+      return 1;
+    }else if (this is! ParametizedType && other is ParametizedType) {
+      // non-parametized types are before parametized types
+      return -1;
+    }else{
+      return ref.compareTo(other.ref);
+    }
+  }
   bool isSubtypeOf(TType other) {
-    // todo: make sure eq is using the same thing as compareTo
-    // todo: cache all components on every type, not just this one. This is currently quadratic.
-    // todo: you're completely failing on parametric types... unless we're currently invariant, which we might be.
-    return allTypeComponents.contains(other);
-    // wait why did I think I needed to do this...
-    // bool ret = true;
-    // // most languages have more efficient approaches to this, but we have to deal with a lot of dynamic objects, and also this is a reference implementation and this code is much simpler.
-    // // other shouldn't have any components that we don't have
-    // typeExtending.comparisonScan(other.typeExtending, onlyInOther: (_){ ret = false; });
-    // return ret;
+    // if this is a unary type then just check the inheriteds of other
+    // if this is a parametric type, consider variance and check all of the other parametric types with the same head
+    // if this is a intersection type, accept any type that has a subset of our components
+    //  wait, isn't this quadratic runtime?
+    //   well, what if you run it against an indexing of all of the components?
+    //    a & b & f<k> & c on g & f<x & y> & z
+    //    well i guess it's quadratic on parametric components
   }
   friendlyName(StringBuffer out);
+  String fname() {
+    StringBuffer out = StringBuffer();
+    friendlyName(out);
+    return out.toString();
+  }
   // /// required for constructing cyclic structures
   // newUninitialized()
   // initialize(List<Obj>)
-  
+
   /// parsing happens in two phases to accomodate the possibiility of cycles. First allocate the object (you need not do anything else) then in the thunk, the objects that you need will all be available in the Cache so you can complete the initialization of your fields (looking up your Refs and getting the associated Objs). If you try to imagine initializing a pair of objects that refer to each other without a process like this, you will find that it cannot be done, except perhaps with lazy evaluation, but Dart doesn't have that, and this essentially is a phased lazy evaluation..
   (Obj, Function(Obj Function(Ref) resolver)) parse(CborValue value);
+
+  /// oh, this doesn't make sense, types are usually not directly related to their best lenses..
+  /// doesn't always do anything, unknown types wont have lenses
+  (Obj, Function(Obj Function(Ref) resolver))? createLens(Component component) {
+    return null;
+  }
+}
+
+/// An intersection type is just an entity, all (non-raw) objects are intersection types, sometimes they only have one component, but here's the central design principle of the whole type system: You never have to write code that assumes that it sees all of the components. Other people can add components anywhere in the structure without breaking your code.
+/// No components are ever IntersectionTypes. Some views might be though? IntersectionTypes are mainly used by the type system and type checking sites.
+class IntersectionType extends TType {
+  // I'm not sure we need this since it goes into typeExtending too.
+  late final List<TType> parts;
+  IntersectionType({List<TType>? parts}) {
+    if(parts != null) {
+      _setParts(parts);
+    }
+  }
+  void _setParts(List<TType> parts) {
+    this.parts = parts;
+    this.typeExtending = TypeSet(parts);
+  }
+  @override
+  friendlyName(StringBuffer out) {
+    out.write('(');
+    bool first = true;
+    for(final p in parts) {
+      if(!first) {
+        out.write(' & ');
+      }
+      p.friendlyName(out);
+      first = false;
+    }
+    out.write(')');
+  }
+  @override
+  void traceComponent(Function(Obj) visitor) {
+    for(final p in parts) {
+      visitor(p);
+    }
+  }
+  @override
+  CborValue toCbor() {
+    return CborList(parts.map((e) => e.ref.toCbor()).toList());
+  }
+  @override
+  (Obj, Function(Obj Function(Ref) resolver)) parse(CborValue value) {
+    final v = assumeParseList(value);
+    final ret = IntersectionType();
+    return (ret, (resolver){
+      ret._setParts(v.map((e)=> expectType<TType>(resolver(Ref.parse(e)), std.typeType)).toList());
+    });
+  }
 }
 
 class Name extends Obj {
@@ -966,6 +1184,14 @@ class IntrinsicType extends TType {
 
 // interpreter stuff
 
+T expectType<T>(Obj o, TType t) {
+  //todo wait this is a lot more complicated than this, you need to check if it's a subtype, then get a lens onto the family of type T
+  if(o.type != t) {
+    throw AssertionError("expected type ${t.fname()} but got ${o.type.fname()}");
+  }
+  return o as T;
+}
+
 class EnumType extends TType {
   late final List<TType> variants;
   // TType discriminator; // must inherit integer or something
@@ -974,7 +1200,10 @@ class EnumType extends TType {
   @override
   friendlyName(StringBuffer out) {
     out.write('(enum');
-    out.write(rootName ?? '_');
+    String? name = rootName();
+    if(name != null) {
+      out.write(' $name');
+    }
     out.write(')');
   }
   @override
@@ -991,23 +1220,25 @@ class EnumType extends TType {
       CborList(variants.map((v) => v.ref.toCbor()).toList())
     ]);
   }
-  
+
   @override
   (Obj, Function(Obj Function(Ref) resolver)) parse(CborValue value) {
     final v = assumeParseList(value, 2);
     final ret = EnumType();
-    return (ret, (_){});
+    return (ret, (resolver){
+      ret.variants = assumeParseList(v[1]).map((e)=> expectType<TType>(resolver(Ref.parse(e)), std.typeType)).toList();
+    });
   }
 }
 
 abstract class Code extends Obj {
   /// says enough about the Code obj to help to identify it, but doesn't necessarily try to print the entire thing
-  Code(): super(type: std.codeType) {}
-  String prettyPrint();
+  Code({super.type, super.extending}) {}
+  void prettyPrint(StringBuffer out);
 }
 
 class LetType extends TType {
-  LetType() : super(typeExtending: SetList([std.codeType]));
+  LetType() : super(typeExtending: TypeSet([std.codeType]));
   @override
   friendlyName(StringBuffer out) {
     out.write('let');
@@ -1035,38 +1266,69 @@ class LetType extends TType {
 /// a definition of a variable. Usually has Name and sometimes Description components.
 class Let extends Code {
   late final TType bound;
-  Let([TType? bound]): super(type: std.letType, extending: SetList([CodeComponent()])) {
+  final bool variadic;
+  Let([TType? bound, this.variadic = false]): super(type: std.letType, extending: [CodeComponent(0)]) {
     if(bound != null) {
       this.bound = bound;
     }
   }
   @override
-  String prettyPrint() => "(let $name)";
+  void prettyPrint(StringBuffer out) {
+    String? name = rootName();
+    out.write(name != null ? "(let $name)" : "(let)");
+  }
   @override
   CborValue toCbor() => CborList([
         CborString("let"),
-        CborString(name),
+        CborString(rootName() ?? ""),
         bound.ref.toCbor(),
       ]);
   @override
   void traceComponent(Function(Obj) visitor) {
     visitor(bound);
   }
-  
-  @override
-  String get name => _name;
 }
 
+class EvaluationType extends TType {
+  EvaluationType() : super(typeExtending: TypeSet([std.codeType]));
+  @override
+  friendlyName(StringBuffer out) {
+    out.write('eval');
+  }
+  @override
+  void traceComponent(Function(Obj) visitor) {}
+  @override
+  (Obj, Function(Obj Function(Ref) resolver)) parse(CborValue value) {
+    final v = assumeParseList(value, 2);
+    final ret = Evaluation();
+    return (ret, (resolver){
+      ret.function = expectType<FunctionT>(resolver(Ref.parse(v[0])), std.functionType);
+      ret.args = assumeParseList(v[1]).map((e)=> expectType<Code>(resolver(Ref.parse(e)), std.codeType)).toList();
+    });
+  }
+}
 /// an invocation of a function
 class Evaluation extends Code {
   late final FunctionT function;
-  late final List<Obj> args;
-  Evaluation(this.function, this.args);
+  late final List<Code> args;
+  Evaluation({FunctionT? function, List<Code>? args}): super(type: std.evaluationType, extending: [CodeComponent(1)]) {
+    if(function != null) {
+      this.function = function;
+    }
+    if(args != null) {
+      this.args = args;
+    }
+  }
   @override
-  String prettyPrint() => "(eval ${function.prettyPrint()} ${args.map((e) => e.identify()).join(" ")})";
+  void prettyPrint(StringBuffer out) {
+    out.write("(eval ");
+    function.prettyPrint(out);
+    out.write(" ");
+    out.write(args.map((e) => e.prettyPrint(out)).join(" "));
+    out.write(")");
+  }
   @override
   CborValue toCbor() => CborList([
-        CborString("eval"),
         function.ref.toCbor(),
         CborList(args.map((e) => e.ref.toCbor()).toList())
       ]);
@@ -1079,18 +1341,24 @@ class Evaluation extends Code {
   }
 }
 
-class DoBlock extends Code {}
+class DoBlock extends Code {
+
+}
 
 class FunctionT extends Code {
   List<Let> params;
   DoBlock body;
-  FunctionT(this.params, this.body) : super(Std.functionType);
+  FunctionT(this.params, this.body) : super(type: std.functionType);
   @override
-  String prettyPrint() {
-    String firstPart =
-        this is Name ? "(Function ${(this as Name).name} " : "(Function ";
-    String secondPart = "(${params.map((e) => e.prettyPrint()).join(" ")} ...)";
-    return "$firstPart$secondPart";
+  void prettyPrint(StringBuffer out) {
+    final name = rootName();
+    if(name != null) {
+      out.write("(fn $name ");
+    } else {
+      out.write("(fn ");
+      out.write("(${params.map((e) => e.prettyPrint(out)).join(" ")} ...)");
+      out.write(")");
+    }
   }
 
   @override
@@ -1150,162 +1418,59 @@ Obj run(Obj program, {int evalTimeLimit = -1}) {
   return runtime.result;
 }
 
-class FieldInfo {
-  late final String name;
-  late final TType type;
-  late final String description;
-  FieldInfo({required this.name, required this.type, this.description = ""});
+class Description extends Obj {
+  String description;
+  Description(this.description) : super(type: std.descriptionType);
+  CborValue toCbor() => CborList([CborString(description)]);
+  void prettyPrint(StringBuffer out) => out.write(description);
 }
 
 class StructType extends TType {
-  final Ref? definition;
   late final List<Let> fields;
-  StructType({this.definition, List<Let>? fields}) {
+  StructType({List<Let>? fields}) {
     if (fields != null) {
       this.fields = fields;
     }
   }
   @override
   friendlyName(StringBuffer out) {
-    out.write('(');
-    bool isFirst = true;
-    for (final f in fields) {
-      if (!isFirst) {
+    final name = rootName();
+    if(name != null) {
+      out.write(name);
+    } else {
+      out.write('(struct ');
+      for (final f in fields) {
         out.write(' ');
+        f.prettyPrint(out);
       }
-      isFirst = false;
-      out.write('(${f.name} ');
-      f.type.friendlyName(out);
       out.write(')');
     }
-    out.write(')');
   }
 
   @override
   CborValue toCbor() {
     return CborList([
-      CborString('struct'),
-      CborNull(),
       CborList(fields
-          .map((f) => CborList([
-                CborString(f.name),
-                f.type.ref.toCbor(),
-              ]))
+          .map((f) => f.ref.toCbor())
           .toList())
     ]);
   }
 
   @override
   void traceComponent(Function(Obj) visitor) {
-    for (FieldInfo fif in fields) {
-      visitor(fif.type);
+    for (final fif in fields) {
+      visitor(fif);
     }
   }
-  
+
   @override
   (Obj, Function(Obj Function(Ref))) parse(CborValue value) {
-    List<CborValue> v = assumeParseList(value, 3);
-    final ret = StructType(definition: definition);
+    List<CborValue> v = assumeParseList(value, 1);
+    final ret = StructType();
     return (ret, (Obj Function(Ref) resolver){
-      ret.fields = assumeParseList(v[3], null).toList().map((e){
-        final el = assumeParseList(e);
-        String name;
-        TType type;
-        return FieldInfo(name: el[0], type: el[1], description: el[2]);
-      }).toList();
+      ret.fields = assumeParseList(v[0]).map((e)=> expectType<Let>(resolver(Ref.parse(e)), std.letType)).toList();
     });
   }
-}
-
-class VarDef extends Obj {
-  late final TType type;
-  final String name;
-  final String description;
-  VarDef({TType? type, required this.name, this.description = ""}) {
-    if (type != null) {
-      this.type = type;
-    }
-  }
-  @override
-  CborValue toCbor() {
-    return CborList(
-        [type.ref.toCbor(), CborString(name), CborString(description)]);
-  }
-
-  @override
-  void traceComponent(Function(Obj) visitor) {
-    visitor(type);
-  }
-}
-
-class TypeParameter extends Obj {
-  final VarDef def;
-  final TypeParameterKind kind;
-  TypeParameter(this.def, this.kind);
-  @override
-  CborValue toCbor() {
-    return CborList([def.toCbor(), CborString(kind.toString())]);
-  }
-
-  @override
-  void traceComponent(Function(Obj) visitor) {
-    visitor(def);
-  }
-}
-
-class Func extends Obj {
-  late final List<VarDef> inputs;
-  final String description;
-  late final TType outputType;
-  Func({List<VarDef>? inputs, TType? outputType, this.description = ""}) {
-    if (inputs != null) {
-      this.inputs = inputs;
-    }
-    if (outputType != null) {
-      this.outputType = outputType;
-    }
-  }
-  @override
-  CborValue toCbor() {
-    return CborList([
-      CborString("function"),
-      CborList(inputs.map((v) => v.toCbor()).toList()),
-      outputType.ref.toCbor(),
-      CborString(description),
-    ]);
-  }
-
-  @override
-  void traceComponent(Function(Obj) visitor) {
-    for (final v in inputs) {
-      visitor(v);
-    }
-    visitor(outputType);
-  }
-}
-
-class ParametricField {
-  // if parameter, type is unimportant, name corresponds to the parameter def name
-  bool get isParameter => type == null && parameterName != null;
-  final String name;
-  final TType? type;
-  final String? parameterName;
-  final String description;
-  CborValue toCbor() => isParameter
-      ? CborList([
-          CborString("parameter"),
-          CborString(name),
-          CborString(parameterName!),
-          CborString(description),
-        ])
-      : CborList([
-          CborString("concrete"),
-          CborString(name),
-          type!.ref.toCbor(),
-          CborString(description),
-        ]);
-  ParametricField(this.name, this.type, this.parameterName,
-      {this.description = ""});
 }
 
 class ParametricStruct extends ParametricType {
@@ -1324,7 +1489,7 @@ class ParametricStruct extends ParametricType {
               ]))
           .toList()),
       CborList(structFields.map((f) => f.toCbor()).toList()),
-      CborString(rootName ?? "_"),
+      CborString(rootName() ?? "_"),
       cborNully(definition?.toCbor())
     ]);
   }
@@ -1349,7 +1514,10 @@ enum TypeParameterKind { instance, subtype }
 abstract class ParametricType extends Obj {
   // the code where it was defined.
   final Ref? definition;
-  final List<TypeParameter> parameterRequirements;
+  // eventually BoundedType<T> needs to be defined, which is a special type that is the set of types that subtype T. Of couse, A subtypes B implies that BoundedType<A> subtypes BoundedType<B>. But where b:B is a B, B:Type is a BoundedType<B>
+  // maybe it should just be Type<bound = T>
+  // which relates to.. how would we specify a type that was a subset of the ints. type natural = int<lowerBound = 0>?
+  final List<Let> parameterRequirements;
   ParametricType(this.definition, this.parameterRequirements)
       : super(type: std.parametizedTypeFunctionType);
 }
@@ -1358,12 +1526,11 @@ class ParametizedType extends TType {
   late final ParametricType pt;
   late final List<Obj> parameters;
   late final TType v;
-  ParametizedType(this.pt, this.parameters) : super() {
-  }
+  ParametizedType(this.pt, this.parameters) : super() {}
   @override
   friendlyName(StringBuffer out) {
     out.write('(');
-    out.write(pt.rootName ?? "_");
+    out.write(pt.rootName() ?? "_");
     out.write(' ');
     var count = 0;
     for (var obj in parameters) {
@@ -1429,9 +1596,11 @@ class Std {
   static late final IntrinsicType staticTypeType;
   late final TType structType;
   static late final TType staticStructType;
-  late final TType letType;
   late final TType codeType;
-  
+  late final TType letType;
+  late final TType evaluationType;
+  late final TType doBlockType;
+
   late final IntrinsicType boolType;
   late final IntrinsicType intType;
   late final IntrinsicType stringType;
@@ -1459,13 +1628,12 @@ class Std {
       var parameters: List<TypeParameter>
       var on: ParametricType
     }
-    
+
     // many objs have a name
     struct Name {
       var name: String
     }
-    
-    // types which are guaranteed to evaluate to an object
+
     enum Code {
       case struct Let {
         var type: Type
@@ -1492,31 +1660,31 @@ class Std {
       }
       case struct Literal { var value: Obj }
     }
-    
+
     // all types are constructed from these
     enum Type {
-      case struct Enum {
-        // enums can define members which all variants must inherit from the enum
+      case Struct {
+        var members: List<Let>
+      }
+      case Enum {
         var members: List<Let>
         var variants: List<Type>
       }
-      case struct Struct {
-        var members: List<Let>
-      }
-      case String
-      case Int
-      case Bool
-      case DateTime
-      case Blob
-      case Nonce
-      case Parametizzed {
+      case Parametized {
         var parameters: List<TypeParameter>
         var on: ParametricType
       }
+      // enums are not sum types, they have a discriminator that allows discrimination even in raw form, and the variants inherit the enum, and no other types can inherit the enum (directly)
+      case Bool
+      case Int
+      case String
+      case Blob
+      case DateTime
+      case Nonce
     }
     */
-    
-    
+
+
     typeType = EnumType();
     staticTypeType = typeType;
     typeType.type = typeType;
@@ -1553,6 +1721,10 @@ class Std {
                   [anyType]))
         ]));
 
+    letType = NamedStructType(fields: [
+
+    ], typeExtending: [codeType]);
+
     fileType = NamedType(
         "file",
         null,
@@ -1562,7 +1734,7 @@ class Std {
         ]));
   }
   initialTypeCommits = commitAll();
-  
+
   // void welcomeCache(Cache cache) {
   // }
 
@@ -1664,7 +1836,8 @@ class IntObj extends Obj {
   int value;
   IntObj(this.value) : super(type: std.intType);
   @override
-  CborValue toCbor() => CborInt(BigInt.from(value));
+  CborValue toCbor() => CborFloat(value.toDouble())..doublePrecision();
+
   @override
   void traceComponent(Function(Obj) visitor) {}
 }
@@ -1816,13 +1989,16 @@ List<(Obj, BinaryPresence)> makeCommit(Obj obj) {
 
 /// completes ref ids and nonces (or null nonces) of all of the objects linked from roots, returns a list of the new objects
 /// ensures that none of the blobs end up with identical refs by adding a nonce component to the ones that clash
-/// (another counterintuitive thing it does is it assigns temporary same_burl ids to items within a burl while the items of that burl are being serialized (before toCbor is called) so that toCbor will resolve local links when appropriate. Anyone implementing a toCbor method (everyone) might like to know this, but I really can't foresee a situation where they'd *need* to.)
+/// (another counterintuitive thing it does is it assigns temporary [parent, index] refs to items within a burl while the items of that burl are being serialized (before toCbor is called) so that toCbor will resolve local links when appropriate, and then the ref is set to [burl_hash, index] after finalization. Anyone implementing a toCbor method (everyone) might like to know this, but I really can't foresee a situation where they'd *need* to.)
+/// `automaticGrouping` is true by default, which means that the objects will be grouped into a minimum number of burls. If false, the objects will be grouped into a single burl regardless of whether there are cycles.
 List<(Obj, BinaryPresence)> makeCommitAll(List<Obj> roots) {
+  // todo: implement non-automatic grouping, which implicitly puts everything in a group regardless of whether there are cycles. This is laughably easy because it's the automatic case that's difficult and that's what we're doing now by default.
+  // , {bool automaticGrouping = true}
   // List<Eobj> roots = roots.map((e) => Eobj(root: e)).toList();
   // the objects currently being fingered by the depth first search
   for (Obj o in roots) {
     // (registers self in o.ancestor)
-    Eobj(root: o);
+    ObjRoot(root: o);
   }
   List<Obj> stack = [];
   List<Obj> allVisited = [];
@@ -1838,7 +2014,7 @@ List<(Obj, BinaryPresence)> makeCommitAll(List<Obj> roots) {
   // first identify burls and create an ordering over the unresolved objects that ensure that the dependencies of an object are always either after it or in its burl.
   // consists of a depth first search that reacts when we hit something that's in the current stack (this is how you find cycles)
   void visit(Obj v) {
-    if (v.family._ref != null) {
+    if (v.totality._ref != null) {
       // it hasn't mutated since acqusiition and doesn't need to be republished
       return;
     }
@@ -1914,19 +2090,19 @@ List<(Obj, BinaryPresence)> makeCommitAll(List<Obj> roots) {
     Obj o = allVisited[avi];
     Burl? b = burlAssignments[o];
     if (b != null) {
-      if (b.family._ref == null) {
+      if (b.totality._ref == null) {
         //resolve everything in the burl, otherwise, nothing needs to be done, this obj is already resolved
 
         // temporarily assign same_burl ids so that when this object is referenced in a serialization by the following toCbor calls, it is a local link
         for (int bi = 0; bi < b.content.length; ++bi) {
-          b.content[bi].family.assignID(Ref.sameBurl(bi));
+          b.content[bi].totality.assignID(Ref.sameBurl(bi));
         }
 
         int renoncingCounter = 0;
         Uint8List burlBinary;
         CID burlID;
         do {
-          b.family.nonce = renoncingCounter > 0
+          b.totality.nonce = renoncingCounter > 0
               ? BigInt.from(renoncingCounter)
               : BigInt.zero;
           ++renoncingCounter;
@@ -1934,12 +2110,12 @@ List<(Obj, BinaryPresence)> makeCommitAll(List<Obj> roots) {
           burlBinary = cborBinary(cburl);
           burlID = cborID(burlBinary);
         } while (idsSoFar.contains(burlID));
-        b.family.assignID(Ref(burlID));
+        b.totality.assignID(Ref(burlID));
         ret.add((b, ImmediateBinaryPresence(burlBinary)));
         for (int boi = 0; boi < b.content.length; ++boi) {
           final id = Ref.intoBurl(burlID, boi);
           Obj bi = b.content[boi];
-          bi.family.assignID(id);
+          bi.totality.assignID(id);
           ret.add((bi, DependentBinaryPresence(burlID)));
         }
       }
@@ -1950,13 +2126,13 @@ List<(Obj, BinaryPresence)> makeCommitAll(List<Obj> roots) {
       int renoncingCounter = 0;
       // again rehash until it's unique
       do {
-        o.family.nonce =
+        o.totality.nonce =
             renoncingCounter > 0 ? BigInt.from(renoncingCounter) : BigInt.zero;
         bin = cborBinary(o.toCbor());
         id = cborID(bin);
         ++renoncingCounter;
       } while (idsSoFar.contains(id));
-      o.family.assignID(Ref(id));
+      o.totality.assignID(Ref(id));
       ret.add((o, ImmediateBinaryPresence(bin)));
     }
   }
@@ -2003,15 +2179,22 @@ abstract class Uplink {
 
   /// (rel, to)
   Stream<(Obj, Obj)> subscribeNeighbor(Obj from, Duration? expiry);
+
+  /// parses a cbor into an obj
+  Future<Obj> receive(Uint8List bin) {
+    // this needs to validate the type, which also means it needs to have the types, so it may have to go back and forth with the sender a few times, but this shouldn't really happen, generally sender and receiver should have consensus about which types are commonly known, and where a recipient may not know a type, it should be sent with the packet.
+    // remember to assign refs to objs as they're parsed
+    // create an ObjRoot. For root components, if there's a registered type, use Type.parse to attach Objs to the root component and return that. Otherwise return a DynamicObj??
+
+  }
 }
 
 /// currently doesn't persist to disk
 class Cache {
   /// just an estimate
   int totalMemoryUsed;
-  // do we want this?:
-  // Map<CID, Obj> baseObjs;
-  Map<Ref, Obj> liveObjs;
+  // should be either ObjRoots or UnknownObjs.
+  Map<Ref, ObjRoot> liveObjs;
   // todo disk stuff, and disk cache size management. Sort items by size x rarity of access and remove the top ones of those first when space is needed.
   //    todo allow pinned objects, and weakly pinned objects (eg, objects that your friends posted)
   // /// used in case of an emergency to switch all of our data over to the next known unbroken hash function
