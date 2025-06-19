@@ -1,9 +1,6 @@
-use std::io::Bytes;
-
-
 /// the following code illustrates how to represent modular objects in an extremely efficient way, consisting ultimately of just two arrays, where upcasts (of upcasts) are just a binary search.
-/// in summary: the component tree is flattened to pre-order. The component map is stored as a sorted array of (key, index, value) tuples. When you're narrowed in on a particular subcomponent, you can still look up a subcomponent of that subcomponent in logarithmic time from the root map of the object by restricting answers to not just (key, _, _) but (key, i, _) .. (key, i + c, _) where i is the index of the subcomponent parent and c is the number of children of the parent.
-/// obviously this isn't very good if you need to mutate the object, but generally states are represented as immutable objects.
+/// in summary: the component tree is flattened to pre-order. The component map is stored as a sorted array of (key, preorder-index, value) tuples. When you're narrowed in on a particular subcomponent, you can still look up a subcomponent of that subcomponent in logarithmic time from the root map of the object by restricting answers to not just (key, _, _) but (key, i, _) .. (key, i + c, _) where i is the index of the subcomponent parent and c is the number of children of the parent.
+/// obviously this isn't very good if you need to mutate the object, but generally, states and messages are represented as immutable objects.
 
 /// a simpler non-flat representation of the component tree. Although parsing IRL might not actually allocate a representation like this, it's here to illustrate how a tree maps to the preorder flattening.
 pub struct Tree<K, V> {
