@@ -78,15 +78,18 @@ impl Obj {
     }
     // returns index within map, or None if not found
     pub fn get(&self, k: &TType) -> Option<usize> {
-        let mut i = self.map.binary_search_by(|(key, _)| key.cmp(k)).ok()?;
-        // iterate back to the first instance matching that key (this is linear, but will rarely recur very often)
-        loop {
-            if i == 0 { break; }
-            let (ref key, _) = self.map[i - 1];
-            if key != k { break; }
-            i -= 1;
+        // by searching for index:0, we will rarely get a direct hit, but if there is an entry of that type, the error case will land on the first one, which is what we want
+        match self.map.binary_search_by(|(key, kindex)| key.cmp(k).then(kindex.cmp(&0))) {
+            Ok(i) => { Some(i) },
+            Err(i) => {
+                if i >= self.map.len() { return None; }
+                if &self.map[i].0 == k {
+                    Some(i)
+                }else{
+                    None
+                }
+            }
         }
-        Some(i)
     }
     // returns index within map, or None if not found
     pub fn get_within(&self, k: &TType, start: usize, end: usize) -> Option<usize> {
