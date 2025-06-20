@@ -2,6 +2,8 @@
 /// in summary: the component tree is flattened to pre-order. The component map is stored as a sorted array of (key, preorder-index, value) tuples. When you're narrowed in on a particular subcomponent, you can still look up a subcomponent of that subcomponent in logarithmic time from the root map of the object by restricting answers to not just (key, _, _) but (key, i, _) .. (key, i + c, _) where i is the index of the subcomponent parent and c is the number of children of the parent.
 /// obviously this isn't very good if you need to mutate the object, but generally, states and messages are represented as immutable objects.
 
+/// This all comes as an expense of respecting the object heirarchy, which is necessary to avoid problems where components can leak from their original context into another.
+
 /// a simpler non-flat representation of the component tree. Although parsing IRL might not actually allocate a representation like this, it's here to illustrate how a tree maps to the preorder flattening.
 pub struct Tree<K, V> {
     k: K,
@@ -118,16 +120,33 @@ impl<'a> Component<'a> {
             index: index,
         })
     }
+    /// logarrithmic if there's only one matching component, roughly log*log otherwise, fast either way.
     pub fn downcast(&self, k: &TType) -> Option<Component<'a>> {
-        // upcasts, and as long as that fails, looks to its immediate parent, repeat
-        let mut eye = self.index;
-        loop {
-            let tc = Component { parent: self.parent, index: eye };
-            if let Some(c) = tc.upcast(k) {
-                return Some(c);
+        match self.parent.map.binary_search_by(|(ttype, tindex)| ttype.cmp(k).then(tindex.cmp(&self.index))) {
+            Ok(i) => { Some(Component { parent: self.parent, index: i }) }
+            Err(i) => {
+                let get_at = |i: usize| -> Option<(TType, usize)> {
+                    let es = self.parent.map[i].clone();
+                    if &es.0 != k { return None; }
+                    Some(es)
+                };
+                let prev = if i > 0 { get_at(i - 1) } else { None };
+                let next = if i < self.parent.map.len() { get_at(i) } else { None };
+                let complete = |o:Option<(TType, usize)>| -> Option<Component<'a>> {
+                    o.map(|(_, i)| Component { parent: self.parent, index: i })
+                };
+                if prev.is_none() { return complete(next); }
+                if next.is_none() { return complete(prev); }
+                // this is the tricky case, if there are two adjacent entries, the downcast will be one or the other, but which one depends on the structure of the inheritance tree
+                let pi = prev.as_ref().unwrap().1;
+                let ni = next.as_ref().unwrap().1;
+                let mut pari = self.parent.components[self.index].parent_index;
+                loop {
+                    if pari <= pi { return complete(prev); }
+                    if pari + self.parent.components[pari].total_descendent_count > ni { return complete(next); }
+                    pari = self.parent.components[pari].parent_index;
+                }
             }
-            if eye == 0 { return None; }
-            eye = self.parent.components[eye].parent_index;
         }
     }
 }
