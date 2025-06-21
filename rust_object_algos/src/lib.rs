@@ -1,10 +1,4 @@
-/// the following code illustrates how to represent modular objects in an extremely efficient way, consisting ultimately of just two arrays, where upcasts (of upcasts) are just a binary search.
-/// in summary: the component tree is flattened to pre-order. The component map is stored as a sorted array of (key, preorder-index, value) tuples. When you're narrowed in on a particular subcomponent, you can still look up a subcomponent of that subcomponent in logarithmic time from the root map of the object by restricting answers to not just (key, _, _) but (key, i, _) .. (key, i + c, _) where i is the index of the subcomponent parent and c is the number of children of the parent.
-/// obviously this isn't very good if you need to mutate the object, but generally, states and messages are represented as immutable objects.
-
-/// This all comes as an expense of respecting the object heirarchy, which is necessary to avoid problems where components can leak from their original context into another.
-
-/// a simpler non-flat representation of the component tree. Although parsing IRL might not actually allocate a representation like this, it's here to illustrate how a tree maps to the preorder flattening.
+/// Tree just represents a simpler non-flat representation of the component tree. Although parsing IRL might not actually allocate a representation like this, it's here to illustrate how a simple tree can be taken as input.
 pub struct Tree<K, V> {
     k: K,
     v: V,
@@ -23,6 +17,7 @@ pub struct ObjectComponentEntry {
     pub parent_index: usize,
 }
 
+/// as noted in the readme, the types should probably store more the `map` part of the Obj, since that structure never changes at runtime, it's the same for every instance of that type.
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Debug)]
 pub struct TType {
     pub definition: Vec<u8>,
@@ -45,9 +40,9 @@ impl<'a> Component<'a> {
     pub fn value(&self) -> &'a ObjectValue {
         &self.parent.components[self.index].value
     }
-    pub fn children(&self) -> &'a [ObjectComponentEntry] {
-        &self.parent.components[self.index .. (self.index + self.parent.components[self.index].total_descendent_count)]
-    }
+    // Obvously you're going to need this, but I'm not sure how this would be implemented!
+    // pub fn children(&self) -> impl Iterator<Item = Component<'a>> {
+    // }
 }
 impl Obj {
     fn recurse_tree(&mut self, mut index: usize, parent_index: usize, tree: &Tree<TType, ObjectValue>)-> usize {
@@ -120,7 +115,7 @@ impl<'a> Component<'a> {
             index: index,
         })
     }
-    /// logarrithmic if there's only one matching component, roughly log*log otherwise, fast either way.
+    /// logarithmic if there's only one matching component, roughly log*log otherwise, fast either way.
     pub fn downcast(&self, k: &TType) -> Option<Component<'a>> {
         match self.parent.map.binary_search_by(|(ttype, tindex)| ttype.cmp(k).then(tindex.cmp(&self.index))) {
             Ok(i) => { Some(Component { parent: self.parent, index: i }) }
@@ -168,6 +163,7 @@ mod tests {
         let bt = TType { definition: to_ov(2) };
         let ct = TType { definition: to_ov(3) };
         let dt = TType { definition: to_ov(4) };
+        // a diamond problem'd inheritance structure
         let tree = Tree {
             k: at,
             v: to_ov(1),
