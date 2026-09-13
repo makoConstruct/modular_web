@@ -1,5 +1,6 @@
-Basics for working with the mw distributed typed object system. Identity, permissioning, parsing, binding generation, syncing, rpc, pubsub.
+(status: superceded/going to merge into a sibling project)
 
+Basics for working with the mw distributed typed object system. Identity, permissioning, parsing, binding generation, syncing, rpc, pubsub.
 
 ## about modular types
 
